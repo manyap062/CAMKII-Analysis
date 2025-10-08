@@ -7,6 +7,8 @@ from matplotlib.figure import Figure
 from scipy import stats, signal
 import seaborn as sns
 import types
+import os
+import matplotlib.pyplot as plt
 
 class CaMKIIAnalyzer:
     def __init__(self, root):
@@ -31,18 +33,45 @@ class CaMKIIAnalyzer:
         # data structure for manual peaks
         self.current_peak_index = 0
         self.manual_peak_boundaries = {}
-        
+
+        # manual overrides for match ids in tables
+        self.manual_match_overrides = {'Rhod': {}, 'FRET': {}}
+
+        # link structures for hover interactions
+        self._table_item_lookup = {'Rhod': {}, 'FRET': {}}
+        self._hovered_peak = {'Rhod': None, 'FRET': None}
+        self._table_edit_entry = None
+        self._table_edit_meta = None
+
         self.fret_color = 'black'
         self.rhod_color = 'red'
         self.plot_title = 'CaMKII and Calcium Analysis'
-        
+
         # analysis parameters
         self.peak_prominence = 0.05
         self.peak_width = 5
         self.baseline_percentile = 10
         self.derivative_threshold = 0.005
-        
+
         self.overlay_var = tk.BooleanVar(value=False)
+
+        self.boundary_diagnostics_enabled = True
+        self._boundary_diag_dir = os.path.join(os.getcwd(), 'boundary_diagnostics')
+
+        self.detection_vars = {
+            'Rhod': {
+                'height': tk.StringVar(value='1.05'),
+                'prominence': tk.StringVar(value='0.05'),
+                'distance': tk.StringVar(value='10'),
+                'width': tk.StringVar(value='3')
+            },
+            'FRET': {
+                'height': tk.StringVar(value='1.005'),
+                'prominence': tk.StringVar(value='0.003'),
+                'distance': tk.StringVar(value='5'),
+                'width': tk.StringVar(value='2')
+            }
+        }
 
         self.setup_ui()
     
@@ -204,7 +233,10 @@ class CaMKIIAnalyzer:
         self._customize_toolbar()
 
         # make canvas interactive for peak selection
+        self.canvas.get_tk_widget().bind('<Enter>', lambda e: self.canvas.get_tk_widget().focus_set())
         self.canvas.mpl_connect('button_press_event', self.on_click)
+        self.canvas.mpl_connect('motion_notify_event', self.on_plot_motion)
+        self.canvas.mpl_connect('axes_leave_event', self.on_axes_leave)
         self.root.bind('<Escape>', lambda event: self._clear_navigation_mode(update_status=True))
 
         # add status bar for user guidance
@@ -212,6 +244,7 @@ class CaMKIIAnalyzer:
         self.status_bar.pack(side=tk.BOTTOM, fill=tk.X)
 
         self._build_edit_pane()
+        self._build_detection_controls()
 
     def _customize_toolbar(self):
         if not hasattr(self, 'toolbar'):
@@ -239,6 +272,42 @@ class CaMKIIAnalyzer:
 
         self.toolbar.draw_rubberband = types.MethodType(draw_rubberband, self.toolbar)
         self.toolbar.remove_rubberband = types.MethodType(remove_rubberband, self.toolbar)
+
+        # disable the pan tool entirely to avoid widgetlock conflicts
+        pan_button = None
+        subplots_button = None
+        if hasattr(self.toolbar, '_buttons'):
+            pan_button = self.toolbar._buttons.pop('Pan', None)
+            subplots_button = self.toolbar._buttons.pop('Subplots', None)
+        for btn in (pan_button, subplots_button):
+            if btn is not None:
+                try:
+                    btn.pack_forget()
+                except Exception:
+                    pass
+
+        def disabled_pan(toolbar, *_, **__):
+            toolbar._active = None
+            toolbar.mode = ''
+            if hasattr(toolbar, '_update_buttons_checked'):
+                toolbar._update_buttons_checked()
+            if hasattr(toolbar.canvas, 'widgetlock'):
+                try:
+                    toolbar.canvas.widgetlock.release(toolbar)
+                except Exception:
+                    pass
+            try:
+                toolbar.set_message('Pan disabled – use scroll or rectangle zoom')
+            except Exception:
+                pass
+
+        self.toolbar.pan = types.MethodType(disabled_pan, self.toolbar)
+
+    def _toolbar_mode(self):
+        if hasattr(self, 'toolbar'):
+            mode = getattr(self.toolbar, 'mode', '') or ''
+            return mode.lower()
+        return ''
 
     def _build_edit_pane(self):
         self.edit_container = ttk.Frame(self.main_frame, padding="6")
@@ -319,6 +388,7 @@ class CaMKIIAnalyzer:
             tree.bind('<Motion>', lambda event, t=tree, d=dataset: self._on_table_motion(event, t, d))
             tree.bind('<Leave>', lambda event, t=tree, d=dataset: self._on_table_leave(t, d))
             tree.bind('<Button-1>', lambda event, t=tree, d=dataset: self._on_table_click(event, t, d))
+            tree.bind('<Double-1>', lambda event, t=tree, d=dataset: self._start_table_edit(event, t, d))
 
         self._table_row_meta = {'Rhod': {}, 'FRET': {}}
         self._current_table_hover = {'Rhod': None, 'FRET': None}
@@ -334,6 +404,40 @@ class CaMKIIAnalyzer:
             tree.tag_configure(self._action_hover_tag, foreground='#b00020')
 
         self._peak_highlight_artists = {'Rhod': None, 'FRET': None}
+        self._table_item_lookup = {'Rhod': {}, 'FRET': {}}
+        self._hovered_peak = {'Rhod': None, 'FRET': None}
+
+    def _build_detection_controls(self):
+        container = ttk.Frame(self.root, padding="4")
+        container.pack(fill=tk.X)
+
+        label = ttk.Label(container, text="Peak Detection Thresholds", font=('TkDefaultFont', 10, 'bold'))
+        label.pack(anchor=tk.W, pady=(0, 4))
+
+        frames = ttk.Frame(container)
+        frames.pack(fill=tk.X)
+
+        for dataset in ('Rhod', 'FRET'):
+            lf = ttk.LabelFrame(frames, text=f"{dataset} Settings")
+            lf.pack(side=tk.LEFT, padx=(0, 8), pady=2, fill=tk.X, expand=True)
+
+            entries = (
+                ('Height', 'height'),
+                ('Prominence', 'prominence'),
+                ('Min Distance', 'distance'),
+                ('Min Width', 'width')
+            )
+
+            for row, (label_text, key) in enumerate(entries):
+                ttk.Label(lf, text=label_text).grid(row=row, column=0, sticky=tk.W, padx=4, pady=2)
+                entry = ttk.Entry(
+                    lf,
+                    textvariable=self.detection_vars[dataset][key],
+                    width=7
+                )
+                entry.grid(row=row, column=1, sticky=tk.W, padx=4, pady=2)
+
+            lf.columnconfigure(1, weight=1)
 
     def toggle_edit_mode(self):
         self.edit_mode = not self.edit_mode
@@ -341,20 +445,25 @@ class CaMKIIAnalyzer:
             self.edit_container.configure(width=360)
             self.edit_container.pack(side=tk.RIGHT, fill=tk.Y)
             self.edit_button.config(text="Hide Edit Pane")
+            self._hovered_peak = {'Rhod': None, 'FRET': None}
             self._refresh_edit_tables()
             self.status_bar.config(text="Edit pane enabled")
         else:
             self.edit_container.pack_forget()
             self.edit_button.config(text="Edit Peaks")
+            self._cancel_table_edit()
             self._clear_table_highlight('Rhod')
             self._clear_table_highlight('FRET')
             self._clear_peak_highlight('Rhod')
             self._clear_peak_highlight('FRET')
+            self._hovered_peak = {'Rhod': None, 'FRET': None}
             self.status_bar.config(text="Edit pane hidden")
 
     def _refresh_edit_tables(self):
         if not getattr(self, 'edit_mode', False):
             return
+
+        self._cancel_table_edit()
 
         if not hasattr(self, 'time_data') or self.time_data is None:
             self._populate_table('Rhod', [])
@@ -378,8 +487,52 @@ class CaMKIIAnalyzer:
             match_map['Rhod'][pair['rhod']['peak_idx']] = idx
             match_map['FRET'][pair['fret']['peak_idx']] = idx
 
-        self._populate_table('Rhod', rhod_metrics, match_map['Rhod'], reading_key)
-        self._populate_table('FRET', fret_metrics, match_map['FRET'], reading_key)
+        rhod_matches = self._resolve_match_map('Rhod', reading_key, rhod_metrics, match_map['Rhod'])
+        fret_matches = self._resolve_match_map('FRET', reading_key, fret_metrics, match_map['FRET'])
+
+        self._populate_table('Rhod', rhod_metrics, rhod_matches, reading_key)
+        self._populate_table('FRET', fret_metrics, fret_matches, reading_key)
+
+    def _resolve_match_map(self, dataset, reading_key, metrics, auto_map):
+        manual_all = self.manual_match_overrides.setdefault(dataset, {})
+        manual_for_reading = manual_all.get(reading_key, {})
+
+        valid_indices = {metric['peak_idx'] for metric in metrics}
+        cleaned_manual = {idx: manual_for_reading[idx] for idx in manual_for_reading if idx in valid_indices}
+
+        if cleaned_manual:
+            manual_all[reading_key] = cleaned_manual
+        else:
+            manual_all.pop(reading_key, None)
+
+        resolved = {}
+        for metric in metrics:
+            peak_idx = metric['peak_idx']
+            if peak_idx in cleaned_manual:
+                resolved[peak_idx] = cleaned_manual[peak_idx]
+            elif peak_idx in auto_map:
+                resolved[peak_idx] = auto_map[peak_idx]
+            else:
+                resolved[peak_idx] = ''
+
+        return resolved
+
+    def _clear_manual_match_override(self, dataset, reading_key, peak_idx):
+        manual_dataset = self.manual_match_overrides.get(dataset)
+        if not manual_dataset or reading_key not in manual_dataset:
+            return
+
+        overrides = manual_dataset.get(reading_key)
+        if peak_idx in overrides:
+            overrides.pop(peak_idx, None)
+            if not overrides:
+                manual_dataset.pop(reading_key, None)
+
+    def _reset_manual_matches(self, reading_key):
+        for dataset in ('Rhod', 'FRET'):
+            manual_dataset = self.manual_match_overrides.get(dataset)
+            if manual_dataset and reading_key in manual_dataset:
+                manual_dataset.pop(reading_key, None)
 
     def _populate_table(self, dataset, metrics, match_map=None, reading_key=None):
         tree = self._table_widgets[dataset]
@@ -388,6 +541,7 @@ class CaMKIIAnalyzer:
         self._current_table_hover[dataset] = None
         self._clear_peak_highlight(dataset, suppress_draw=True)
         self._clear_action_hover(dataset)
+        self._table_item_lookup[dataset].clear()
 
         if not metrics:
             tree.insert('', tk.END, values=('', '', 'No peaks detected', ''), tags=('placeholder',))
@@ -413,6 +567,7 @@ class CaMKIIAnalyzer:
                 'peak_idx': peak_idx,
                 'dataset': dataset
             }
+            self._table_item_lookup[dataset][peak_idx] = item
 
     def _on_table_motion(self, event, tree, dataset):
         row_id = tree.identify_row(event.y)
@@ -457,6 +612,7 @@ class CaMKIIAnalyzer:
 
         meta = self._table_row_meta[dataset].get(item_id)
         if meta is not None:
+            self._hovered_peak[dataset] = meta['peak_idx']
             self._highlight_peak_on_plot(dataset, meta['reading_key'], meta['peak_idx'])
 
     def _clear_table_highlight(self, dataset, suppress_plot=False):
@@ -471,6 +627,7 @@ class CaMKIIAnalyzer:
             except tk.TclError:
                 pass
         self._current_table_hover[dataset] = None
+        self._hovered_peak[dataset] = None
         if not suppress_plot:
             self._clear_peak_highlight(dataset)
 
@@ -512,6 +669,245 @@ class CaMKIIAnalyzer:
                     self._clear_table_highlight(dataset)
                     return 'break'
 
+    def _start_table_edit(self, event, tree, dataset):
+        if not hasattr(self, 'time_data') or self.time_data is None:
+            return
+
+        column_id = tree.identify_column(event.x)
+        row_id = tree.identify_row(event.y)
+        if not row_id or 'placeholder' in tree.item(row_id, 'tags'):
+            return
+
+        columns = tree['columns']
+        if column_id and column_id.startswith('#'):
+            index = int(column_id.replace('#', '')) - 1
+            if index < 0 or index >= len(columns):
+                return
+            column_key = columns[index]
+            if column_key not in ('time', 'match'):
+                return
+        else:
+            return
+
+        bbox = tree.bbox(row_id, column_id)
+        if not bbox:
+            return
+
+        meta = self._table_row_meta.get(dataset, {}).get(row_id)
+        if meta is None:
+            return
+
+        self._cancel_table_edit()
+
+        x, y, width, height = bbox
+        current_value = tree.set(row_id, column_key)
+        entry = tk.Entry(tree, borderwidth=1, relief=tk.SOLID)
+        entry.insert(0, current_value)
+        entry.select_range(0, tk.END)
+        entry.focus_set()
+        entry.place(x=x, y=y, width=width, height=height)
+
+        self._table_edit_entry = entry
+        self._table_edit_meta = {
+            'dataset': dataset,
+            'reading_key': meta['reading_key'],
+            'peak_idx': meta['peak_idx'],
+            'row_id': row_id,
+            'column': column_key
+        }
+
+        entry.bind('<Return>', lambda e: self._commit_table_edit())
+        entry.bind('<Escape>', lambda e: self._cancel_table_edit())
+        entry.bind('<FocusOut>', lambda e: self._commit_table_edit())
+        return 'break'
+
+    def _cancel_table_edit(self):
+        if self._table_edit_entry is not None:
+            entry = self._table_edit_entry
+            self._table_edit_entry = None
+            self._table_edit_meta = None
+            try:
+                entry.destroy()
+            except Exception:
+                pass
+
+    def _commit_table_edit(self):
+        entry = self._table_edit_entry
+        meta = self._table_edit_meta
+        if entry is None or meta is None:
+            return
+
+        column = meta.get('column')
+        if column == 'time':
+            self._commit_time_value(entry, meta)
+        elif column == 'match':
+            self._commit_match_value(entry, meta)
+        else:
+            self._cancel_table_edit()
+
+    def _commit_time_value(self, entry, meta):
+        value = entry.get().strip()
+        dataset = meta['dataset']
+        reading_key = meta['reading_key']
+        old_idx = meta['peak_idx']
+
+        if not value:
+            messagebox.showwarning("Invalid Time", "Please enter a numeric time value.")
+            entry.focus_set()
+            entry.select_range(0, tk.END)
+            return
+
+        try:
+            requested_time = float(value)
+        except ValueError:
+            messagebox.showwarning("Invalid Time", "Time values must be numeric.")
+            entry.focus_set()
+            entry.select_range(0, tk.END)
+            return
+
+        if self.time_data is None or len(self.time_data) == 0:
+            self._cancel_table_edit()
+            return
+
+        time_array = self.time_data.values
+        nearest_idx = int(np.argmin(np.abs(time_array - requested_time)))
+        snapped_time = float(self.time_data.iloc[nearest_idx])
+
+        peaks_dict = self.rhod_peaks if dataset == 'Rhod' else self.fret_peaks
+
+        if reading_key not in peaks_dict:
+            self._cancel_table_edit()
+            return
+
+        peaks = peaks_dict[reading_key]
+        if peaks.size == 0:
+            self._cancel_table_edit()
+            return
+
+        indices = np.where(peaks == old_idx)[0]
+        if indices.size == 0:
+            self._cancel_table_edit()
+            return
+
+        if nearest_idx == old_idx:
+            self._cancel_table_edit()
+            self.status_bar.config(text=f"No change: {dataset} peak already at {snapped_time:.2f} min")
+            return
+
+        if nearest_idx in peaks and nearest_idx != old_idx:
+            messagebox.showwarning(
+                "Duplicate Peak",
+                f"A {dataset} peak already exists at {snapped_time:.2f} min."
+            )
+            entry.focus_set()
+            entry.select_range(0, tk.END)
+            return
+
+        new_peaks = peaks.copy()
+        new_peaks[indices[0]] = nearest_idx
+        order = np.argsort(new_peaks)
+        new_peaks = new_peaks[order].astype(int)
+        peaks_dict[reading_key] = new_peaks
+
+        self._rebuild_peak_properties(dataset, reading_key)
+
+        overrides = self.manual_match_overrides.get(dataset, {}).get(reading_key)
+        if overrides and old_idx in overrides:
+            overrides[nearest_idx] = overrides.pop(old_idx)
+
+        self._cancel_table_edit()
+
+        self.update_plot()
+
+        if getattr(self, 'edit_mode', False):
+            self._highlight_table_from_plot(dataset, nearest_idx)
+
+        if snapped_time != requested_time:
+            self.status_bar.config(
+                text=f"Moved {dataset} peak to {snapped_time:.2f} min (snapped to nearest point)"
+            )
+        else:
+            self.status_bar.config(text=f"Moved {dataset} peak to {snapped_time:.2f} min")
+
+    def _commit_match_value(self, entry, meta):
+        value = entry.get().strip()
+        dataset = meta['dataset']
+        reading_key = meta['reading_key']
+        peak_idx = meta['peak_idx']
+
+        manual_dataset = self.manual_match_overrides.setdefault(dataset, {})
+        overrides = manual_dataset.get(reading_key)
+
+        if not value:
+            cleared = False
+            if overrides and peak_idx in overrides:
+                overrides.pop(peak_idx, None)
+                cleared = True
+                if not overrides:
+                    manual_dataset.pop(reading_key, None)
+
+            self._cancel_table_edit()
+
+            if getattr(self, 'edit_mode', False):
+                self._refresh_edit_tables()
+                self._highlight_table_from_plot(dataset, peak_idx)
+
+            if cleared:
+                time_text = ''
+                if self.time_data is not None and 0 <= peak_idx < len(self.time_data):
+                    time_text = f" at {float(self.time_data.iloc[peak_idx]):.2f} min"
+                self.status_bar.config(text=f"Cleared {dataset} match override{time_text}")
+            return
+
+        try:
+            match_id = int(value)
+        except ValueError:
+            messagebox.showwarning("Invalid Match", "Match values must be integers.")
+            entry.focus_set()
+            entry.select_range(0, tk.END)
+            return
+
+        if match_id <= 0:
+            messagebox.showwarning("Invalid Match", "Match values must be positive integers.")
+            entry.focus_set()
+            entry.select_range(0, tk.END)
+            return
+
+        tree = self._table_widgets.get(dataset)
+        if tree is not None:
+            for item in tree.get_children(''):
+                if item == meta.get('row_id'):
+                    continue
+                if 'placeholder' in tree.item(item, 'tags'):
+                    continue
+                existing = tree.set(item, 'match').strip()
+                if existing and existing == str(match_id):
+                    entry.delete(0, tk.END)
+                    messagebox.showwarning(
+                        "Duplicate Match",
+                        f"Match {match_id} is already assigned to another {dataset} peak."
+                    )
+                    entry.focus_set()
+                    return
+
+        if overrides is None:
+            overrides = {}
+            manual_dataset[reading_key] = overrides
+
+        overrides[peak_idx] = match_id
+
+        self._cancel_table_edit()
+
+        if getattr(self, 'edit_mode', False):
+            self._refresh_edit_tables()
+            self._highlight_table_from_plot(dataset, peak_idx)
+
+        time_text = ''
+        if self.time_data is not None and 0 <= peak_idx < len(self.time_data):
+            time_text = f" at {float(self.time_data.iloc[peak_idx]):.2f} min"
+
+        self.status_bar.config(text=f"Set {dataset} match to {match_id}{time_text}")
+
     def _highlight_peak_on_plot(self, dataset, reading_key, peak_idx):
         if self.time_data is None:
             return
@@ -552,6 +948,104 @@ class CaMKIIAnalyzer:
             if not suppress_draw:
                 self.canvas.draw_idle()
 
+    # moving cursor across detected peak while edit mode is on highlights marker and row in table
+    def _highlight_table_from_plot(self, dataset, peak_idx):
+        if not getattr(self, 'edit_mode', False):
+            return
+
+        if not hasattr(self, '_table_widgets'):
+            return
+
+        tree = self._table_widgets.get(dataset)
+        if tree is None:
+            return
+
+        item = self._table_item_lookup.get(dataset, {}).get(peak_idx)
+        if not item:
+            self._clear_table_highlight(dataset, suppress_plot=True)
+            return
+
+        tree.see(item)
+        current = self._current_table_hover.get(dataset)
+        if current == item:
+            return
+
+        self._clear_table_highlight(dataset, suppress_plot=True)
+        tags = set(tree.item(item, 'tags'))
+        tags.add(self._hover_tag)
+        tree.item(item, tags=tuple(tags))
+        self._current_table_hover[dataset] = item
+
+    def _clear_hover_state(self, dataset=None):
+        if not hasattr(self, '_table_widgets'):
+            return
+
+        targets = ['Rhod', 'FRET'] if dataset is None else [dataset]
+        for ds in targets:
+            self._hovered_peak[ds] = None
+            self._clear_peak_highlight(ds)
+            self._clear_table_highlight(ds, suppress_plot=True)
+
+    def on_plot_motion(self, event):
+        if self.time_data is None or not getattr(self, 'edit_mode', False):
+            return
+
+        if 'zoom' in self._toolbar_mode():
+            return
+
+        if event.inaxes is None or event.xdata is None:
+            self._clear_hover_state()
+            return
+
+        axis = event.inaxes
+        overlay_mode = self.overlay_var.get()
+
+        if axis == self.ax1:
+            dataset = 'FRET'
+        elif axis == self.ax2 and not overlay_mode:
+            dataset = 'Rhod'
+        elif axis == self.ax_overlay and overlay_mode:
+            dataset = 'Rhod'
+        else:
+            self._clear_hover_state()
+            return
+
+        reading = int(self.reading_var.get())
+        reading_key = f'#{reading}'
+        peaks_dict = self.fret_peaks if dataset == 'FRET' else self.rhod_peaks
+
+        if reading_key not in peaks_dict or len(peaks_dict[reading_key]) == 0:
+            self._clear_hover_state(dataset)
+            return
+
+        peaks = peaks_dict[reading_key]
+        peak_times = self.time_data.iloc[peaks].values
+        diffs = np.abs(peak_times - event.xdata)
+
+        if len(diffs) == 0:
+            self._clear_hover_state(dataset)
+            return
+
+        xmin, xmax = axis.get_xlim()
+        view_span = max(abs(xmax - xmin), 1e-6)
+        tolerance = max(view_span * 0.01, 0.02)
+        closest = int(np.argmin(diffs))
+
+        if diffs[closest] <= tolerance:
+            peak_idx = int(peaks[closest])
+            if self._hovered_peak.get(dataset) != peak_idx:
+                self._highlight_peak_on_plot(dataset, reading_key, peak_idx)
+                self._highlight_table_from_plot(dataset, peak_idx)
+                self._hovered_peak[dataset] = peak_idx
+            return
+
+        self._clear_hover_state(dataset)
+
+    def on_axes_leave(self, event):
+        if not getattr(self, 'edit_mode', False):
+            return
+        self._clear_hover_state()
+
     def _delete_peak(self, dataset, reading_key, peak_idx):
         if self.time_data is None:
             return
@@ -576,10 +1070,389 @@ class CaMKIIAnalyzer:
             peaks_dict.pop(reading_key, None)
             props_dict.pop(reading_key, None)
 
+        self._clear_manual_match_override(dataset, reading_key, peak_idx)
+
         self.update_plot()
         self._notify_peaks_updated()
         peak_time = float(self.time_data.iloc[peak_idx]) if peak_idx < len(self.time_data) else peak_idx
+        self._hovered_peak[dataset] = None
         self.status_bar.config(text=f"Removed {dataset} peak at {peak_time:.2f} min")
+
+    def _build_single_peak_property(self, dataset, series, peak_idx, left_base=None, right_base=None):
+        length = len(series)
+        if length == 0:
+            return {
+                'peak_idx': peak_idx,
+                'peak_height': 0.0,
+                'left_base': peak_idx,
+                'right_base': peak_idx,
+                'prominence': 0.0,
+                'width': 1.0,
+                'baseline': 0.0
+        }
+
+        if left_base is None or right_base is None:
+            ppm = max(1.0, self._estimate_points_per_minute())
+            window_points = max(7, int(ppm * 4.0))
+
+            segment_start = max(0, peak_idx - window_points)
+            segment_end = min(length, peak_idx + window_points + 1)
+
+            segment_series = series.iloc[segment_start:segment_end]
+            segment_time = self.time_data.iloc[segment_start:segment_end].values
+            segment_values = segment_series.values.astype(float)
+            segment_len = len(segment_values)
+
+            peak_local_idx = peak_idx - segment_start
+
+            smooth_window = max(5, int(ppm * 1.5))
+            smooth_window = min(segment_len, smooth_window)
+            if smooth_window <= 1:
+                smooth_window = segment_len
+            kernel = np.ones(smooth_window, dtype=float) / max(smooth_window, 1)
+            if smooth_window > 1:
+                smoothed = np.convolve(segment_values, kernel, mode='same')
+            else:
+                smoothed = segment_values
+
+            try:
+                derivative = np.gradient(smoothed, segment_time)
+            except Exception:
+                derivative = np.gradient(smoothed)
+
+            eps = max(1e-6, np.std(derivative) * 0.05)
+            derivative_sign = np.zeros_like(derivative)
+            derivative_sign[derivative > eps] = 1.0
+            derivative_sign[derivative < -eps] = -1.0
+
+            if left_base is None:
+                for i in range(peak_local_idx, 0, -1):
+                    prev_sign = derivative_sign[i - 1]
+                    curr_sign = derivative_sign[i]
+                    if prev_sign < 0 and curr_sign >= 0:
+                        left_base = segment_start + i
+                        break
+            if (left_base is None or left_base >= peak_idx) and peak_local_idx > 0:
+                left_rel = int(np.argmin(smoothed[:peak_local_idx]))
+                left_base = segment_start + left_rel
+            if left_base is None or left_base >= peak_idx:
+                left_base = max(0, peak_idx - 1)
+
+            if right_base is None:
+                for i in range(peak_local_idx, segment_len - 1):
+                    curr_sign = derivative_sign[i]
+                    next_sign = derivative_sign[i + 1]
+                    if curr_sign <= 0 and next_sign > 0:
+                        right_base = segment_start + i + 1
+                        break
+            if (right_base is None or right_base <= peak_idx) and peak_local_idx + 1 < segment_len:
+                right_rel = int(np.argmin(smoothed[peak_local_idx + 1:]))
+                right_base = peak_idx + 1 + right_rel
+            if right_base is None or right_base <= peak_idx:
+                right_base = min(length - 1, peak_idx + 1)
+        else:
+            left_base = int(max(0, min(left_base, peak_idx - 1)))
+            right_base = int(min(length - 1, max(right_base, peak_idx + 1)))
+
+        peak_value = float(series.iloc[peak_idx])
+        left_val = float(series.iloc[left_base]) if 0 <= left_base < length else peak_value
+        right_val = float(series.iloc[right_base]) if 0 <= right_base < length else peak_value
+        baseline = (left_val + right_val) / 2.0
+
+        prominence = max(0.0, peak_value - baseline)
+
+        width_samples = float(max(1, right_base - left_base))
+
+        return {
+            'peak_idx': peak_idx,
+            'peak_height': peak_value,
+            'left_base': left_base,
+            'right_base': right_base,
+            'prominence': prominence,
+            'width': width_samples,
+            'baseline': baseline
+        }
+
+    def _derive_peak_boundaries(self, series, peaks):
+        if len(peaks) == 0:
+            return []
+
+        data = series.values.astype(float)
+        length = len(series)
+        boundaries = []
+
+        for i, peak_idx in enumerate(peaks):
+            prev_peak = peaks[i - 1] if i > 0 else None
+            next_peak = peaks[i + 1] if i < len(peaks) - 1 else None
+
+            # left boundary search between previous peak and current peak
+            if prev_peak is not None and prev_peak < peak_idx:
+                search_start = prev_peak
+            else:
+                if next_peak is not None and next_peak > peak_idx:
+                    span = max(3, int((next_peak - peak_idx) / 2))
+                else:
+                    span = max(3, int(length * 0.02))
+                search_start = max(0, peak_idx - span)
+
+            search_end = peak_idx
+            if search_end <= search_start:
+                left_base = max(0, peak_idx - 1)
+            else:
+                window = data[search_start:search_end]
+                if len(window) == 0:
+                    left_base = max(0, peak_idx - 1)
+                else:
+                    left_rel = int(np.argmin(window))
+                    left_base = search_start + left_rel
+
+            # right boundary search between current peak and next peak
+            if next_peak is not None and next_peak > peak_idx:
+                search_stop = next_peak
+            else:
+                if left_base < peak_idx:
+                    padding = max(3, peak_idx - left_base)
+                else:
+                    padding = max(3, int(length * 0.02))
+                search_stop = min(length - 1, peak_idx + padding)
+
+            search_start_right = peak_idx + 1
+            if search_start_right >= search_stop:
+                right_base = min(length - 1, peak_idx + 1)
+            else:
+                window = data[search_start_right:search_stop + 1]
+                if len(window) == 0:
+                    right_base = min(length - 1, peak_idx + 1)
+                else:
+                    right_rel = int(np.argmin(window))
+                    right_base = search_start_right + right_rel
+
+            if right_base <= peak_idx:
+                right_base = min(length - 1, peak_idx + 1)
+            if left_base >= peak_idx:
+                left_base = max(0, peak_idx - 1)
+
+            boundaries.append((left_base, right_base))
+
+        return boundaries
+
+    def _select_hybrid_boundaries(self, series, peaks, reference_props=None):
+        length = len(series)
+        if len(peaks) == 0:
+            return []
+
+        valley_bounds = self._derive_peak_boundaries(series, peaks)
+        width_bounds = self._peak_width_boundary_estimates(series, peaks)
+
+        reference_props = reference_props or []
+        tail_margin = max(5, int(np.ceil(0.02 * length)))
+        tail_guard = max(0, length - tail_margin)
+        final_bounds = []
+
+        for i, peak_idx in enumerate(peaks):
+            prev_peak = peaks[i - 1] if i > 0 else None
+            next_peak = peaks[i + 1] if i < len(peaks) - 1 else None
+
+            width_left, width_right = width_bounds[i] if i < len(width_bounds) else (None, None)
+            valley_left, valley_right = valley_bounds[i] if i < len(valley_bounds) else (None, None)
+
+            ref_left = ref_right = None
+            if i < len(reference_props):
+                ref_left = reference_props[i].get('left_base')
+                ref_right = reference_props[i].get('right_base')
+
+            left = width_left if width_left is not None else valley_left
+            right = width_right if width_right is not None else valley_right
+
+            if left is None and ref_left is not None:
+                left = ref_left
+            if right is None and ref_right is not None:
+                right = ref_right
+
+            if left is None:
+                left = peak_idx - 1
+            if right is None:
+                right = peak_idx + 1
+
+            left = int(max(0, left))
+            right = int(min(length - 1, right))
+
+            if prev_peak is not None:
+                midpoint_left = prev_peak + max(1, (peak_idx - prev_peak) // 2)
+                left = min(left, midpoint_left)
+                left = max(prev_peak + 1, left)
+            else:
+                left = max(0, left)
+
+            if next_peak is not None:
+                midpoint_right = peak_idx + max(1, (next_peak - peak_idx) // 2)
+                right = min(right, midpoint_right)
+                right = min(next_peak - 1, right)
+            else:
+                right = min(right, tail_guard)
+
+            if left >= peak_idx:
+                left = max(peak_idx - 1, 0)
+            if right <= peak_idx:
+                right = min(peak_idx + 1, tail_guard)
+
+            if right <= left:
+                right = min(length - 1, left + 1)
+
+            final_bounds.append((left, right))
+
+        return final_bounds
+
+    def _peak_width_boundary_estimates(self, series, peaks):
+        length = len(series)
+        if len(peaks) == 0:
+            return []
+
+        try:
+            results = signal.peak_widths(series.values.astype(float), peaks, rel_height=1.0)
+            left_ips = np.clip(np.floor(results[2]).astype(int), 0, length - 1)
+            right_ips = np.clip(np.ceil(results[3]).astype(int), 0, length - 1)
+            return list(zip(left_ips, right_ips))
+        except Exception:
+            return [(None, None) for _ in peaks]
+
+    def _ensure_boundary_diag_dir(self):
+        try:
+            os.makedirs(self._boundary_diag_dir, exist_ok=True)
+        except Exception as exc:
+            print(f"Warning creating diagnostics dir: {exc}")
+
+    def _run_boundary_diagnostics(self, reading_key, payload):
+        if self.time_data is None:
+            return
+
+        self._ensure_boundary_diag_dir()
+        reading_num = reading_key.replace('#', '')
+        diagnostics_rows = []
+
+        for dataset, info in payload.items():
+            series = info.get('series')
+            peaks = info.get('peaks')
+            props = info.get('props')
+
+            if series is None or peaks is None or len(peaks) == 0:
+                continue
+
+            peaks_array = np.asarray(peaks, dtype=int)
+            valley_bounds = self._derive_peak_boundaries(series, peaks_array)
+            width_bounds = self._peak_width_boundary_estimates(series, peaks_array)
+
+            scipy_bounds = []
+            if props is not None:
+                for p in props:
+                    left = int(p.get('left_base', p.get('peak_idx', 0)))
+                    right = int(p.get('right_base', p.get('peak_idx', 0)))
+                    scipy_bounds.append((left, right))
+            else:
+                scipy_bounds = [(None, None) for _ in peaks_array]
+
+            while len(valley_bounds) < len(peaks_array):
+                valley_bounds.append((None, None))
+            while len(width_bounds) < len(peaks_array):
+                width_bounds.append((None, None))
+            while len(scipy_bounds) < len(peaks_array):
+                scipy_bounds.append((None, None))
+
+            time_values = self.time_data.values.astype(float)
+            fig, ax = plt.subplots(figsize=(12, 4))
+            ax.plot(self.time_data, series, label=f'{dataset} trace', color='#1f77b4', linewidth=1.2)
+            ax.scatter(self.time_data.iloc[peaks_array], series.iloc[peaks_array], color='black', s=15, label='Detected peaks')
+
+            for idx, peak_idx in enumerate(peaks_array):
+                prev_peak = peaks_array[idx - 1] if idx > 0 else None
+                next_peak = peaks_array[idx + 1] if idx < len(peaks_array) - 1 else None
+
+                scipy_left, scipy_right = scipy_bounds[idx]
+                valley_left, valley_right = valley_bounds[idx]
+                width_left, width_right = width_bounds[idx]
+
+                diagnostics_rows.append({
+                    'reading': reading_num,
+                    'dataset': dataset,
+                    'peak_index': int(peak_idx),
+                    'peak_time_min': float(time_values[peak_idx]),
+                    'prev_peak_index': int(prev_peak) if prev_peak is not None else '',
+                    'next_peak_index': int(next_peak) if next_peak is not None else '',
+                    'scipy_left': int(scipy_left) if scipy_left is not None else '',
+                    'scipy_right': int(scipy_right) if scipy_right is not None else '',
+                    'valley_left': int(valley_left) if valley_left is not None else '',
+                    'valley_right': int(valley_right) if valley_right is not None else '',
+                    'peak_width_left': int(width_left) if width_left is not None else '',
+                    'peak_width_right': int(width_right) if width_right is not None else ''
+                })
+
+                candidate_lines = [
+                    (scipy_left, '#d62728', 'SciPy left'),
+                    (scipy_right, '#d62728', 'SciPy right'),
+                    (valley_left, '#1f77b4', 'Valley left'),
+                    (valley_right, '#1f77b4', 'Valley right'),
+                    (width_left, '#2ca02c', 'PeakWidth left'),
+                    (width_right, '#2ca02c', 'PeakWidth right')
+                ]
+
+                for candidate_idx, color, label in candidate_lines:
+                    if candidate_idx is None or candidate_idx == '':
+                        continue
+                    if not (0 <= int(candidate_idx) < len(time_values)):
+                        continue
+                    ax.axvline(
+                        x=time_values[int(candidate_idx)],
+                        color=color,
+                        alpha=0.15,
+                        linestyle='--'
+                    )
+
+            ax.set_title(f'{dataset} boundary diagnostics – Reading {reading_num}')
+            ax.set_xlabel('Time (min)')
+            ax.set_ylabel('Normalized signal')
+            ax.legend(loc='upper right')
+            fig.tight_layout()
+
+            fig_path = os.path.join(
+                self._boundary_diag_dir,
+                f'{dataset.lower()}_reading_{reading_num}_diagnostics.png'
+            )
+            fig.savefig(fig_path, dpi=150)
+            plt.close(fig)
+
+        if diagnostics_rows:
+            diag_df = pd.DataFrame(diagnostics_rows)
+            csv_path = os.path.join(
+                self._boundary_diag_dir,
+                f'reading_{reading_num}_boundary_candidates.csv'
+            )
+            diag_df.to_csv(csv_path, index=False)
+    def _rebuild_peak_properties(self, dataset, reading_key):
+        peaks_dict = self.rhod_peaks if dataset == 'Rhod' else self.fret_peaks
+        props_dict = self.rhod_peak_properties if dataset == 'Rhod' else self.fret_peak_properties
+        series_dict = self.rhod_normalized if dataset == 'Rhod' else self.fret_normalized
+
+        if reading_key not in peaks_dict or reading_key not in series_dict:
+            return
+
+        peaks = peaks_dict[reading_key]
+        if peaks.size == 0:
+            props_dict.pop(reading_key, None)
+            return
+
+        sorted_indices = np.argsort(peaks)
+        peaks = peaks[sorted_indices].astype(int)
+        peaks_dict[reading_key] = peaks
+
+        series = series_dict[reading_key]
+        existing_props = props_dict.get(reading_key, [])
+        boundaries = self._select_hybrid_boundaries(series, peaks, existing_props)
+
+        new_props = []
+        for idx, (peak_idx, bounds) in enumerate(zip(peaks, boundaries)):
+            left_base, right_base = bounds
+            new_props.append(self._build_single_peak_property(dataset, series, int(peak_idx), left_base, right_base))
+        props_dict[reading_key] = new_props
 
     def _notify_peaks_updated(self):
         if getattr(self, 'edit_mode', False):
@@ -746,6 +1619,8 @@ class CaMKIIAnalyzer:
         if self.time_data is None:
             return metrics
 
+        trapezoid = getattr(np, 'trapezoid', np.trapz)
+
         for idx, props in enumerate(peak_properties):
             peak_idx = props['peak_idx']
             left_idx = max(0, props['left_base'])
@@ -764,7 +1639,7 @@ class CaMKIIAnalyzer:
 
             time_segment = self.time_data.iloc[left_idx:right_idx+1].values
             signal_segment = data_series.iloc[left_idx:right_idx+1].values
-            auc = np.trapz(signal_segment - baseline, time_segment)
+            auc = trapezoid(signal_segment - baseline, time_segment)
             auc = max(0.0, float(auc))
 
             rise_time, decay_time = self._rise_decay_times(data_series, peak_idx, left_idx, right_idx, baseline)
@@ -863,8 +1738,16 @@ class CaMKIIAnalyzer:
         self._clear_peak_highlight('Rhod', suppress_draw=True)
         self._clear_peak_highlight('FRET', suppress_draw=True)
 
+        stored_xlim = self.ax1.get_xlim() if self.ax1.has_data() else None
+
         self.ax1.clear()
         self.ax1.set_ylabel('FRET change')
+
+        if hasattr(self, '_hovered_peak'):
+            self._hovered_peak = {'Rhod': None, 'FRET': None}
+        if hasattr(self, '_table_widgets'):
+            self._clear_table_highlight('Rhod', suppress_plot=True)
+            self._clear_table_highlight('FRET', suppress_plot=True)
 
         if overlay_mode:
             self.ax_overlay.set_visible(True)
@@ -970,6 +1853,20 @@ class CaMKIIAnalyzer:
                 legend_labels = list(legend_map.keys())
                 rhod_axis.legend(legend_handles, legend_labels)
 
+        if self.time_data is not None and stored_xlim is not None:
+            full_min = float(self.time_data.min())
+            full_max = float(self.time_data.max())
+            full_span = full_max - full_min
+            stored_span = stored_xlim[1] - stored_xlim[0]
+
+            restore = False
+            if full_span > 0 and stored_span > 0 and not np.isclose(stored_span, full_span):
+                restore = True
+
+            if restore:
+                self.ax1.set_xlim(stored_xlim)
+                rhod_axis.set_xlim(stored_xlim)
+
         self.fig.suptitle(self.plot_title)
         self.canvas.draw_idle()
 
@@ -994,6 +1891,55 @@ class CaMKIIAnalyzer:
             self.fig.savefig(file_path, dpi=300, bbox_inches='tight')
             messagebox.showinfo("Success", f"Plot saved to {file_path}")
     
+    def _get_detection_params(self, dataset):
+        vars_map = self.detection_vars.get(dataset)
+        if not vars_map:
+            return None
+
+        errors = []
+
+        def parse_float(key, label):
+            value = vars_map[key].get().strip()
+            if not value:
+                errors.append(f"{dataset} {label} is required")
+                return None
+            try:
+                return float(value)
+            except ValueError:
+                errors.append(f"{dataset} {label} must be numeric")
+                return None
+
+        def parse_positive_int(key, label):
+            value = vars_map[key].get().strip()
+            if not value:
+                errors.append(f"{dataset} {label} is required")
+                return None
+            try:
+                num = int(float(value))
+            except ValueError:
+                errors.append(f"{dataset} {label} must be numeric")
+                return None
+            if num <= 0:
+                errors.append(f"{dataset} {label} must be greater than 0")
+                return None
+            return num
+
+        height = parse_float('height', 'height')
+        prominence = parse_float('prominence', 'prominence')
+        distance = parse_positive_int('distance', 'min distance')
+        width = parse_positive_int('width', 'min width')
+
+        if errors:
+            messagebox.showwarning("Peak Detection", "\n".join(errors))
+            return None
+
+        return {
+            'height': max(height, 0.0),
+            'prominence': max(prominence, 0.0),
+            'distance': distance,
+            'width': width
+        }
+
     def detect_peaks(self):
         if self.rhod_data is None and self.fret_data is None:
             messagebox.showwarning("Warning", "Please load both Rhod and FRET data first.")
@@ -1021,23 +1967,30 @@ class CaMKIIAnalyzer:
             messagebox.showwarning("Warning", f"Reading {reading} not found in {label} data.")
             return
 
+        self._reset_manual_matches(reading_key)
+
         rhod_data = self.rhod_normalized[reading_key]
         fret_data = self.fret_normalized[reading_key]
 
+        rhod_params = self._get_detection_params('Rhod')
+        fret_params = self._get_detection_params('FRET')
+        if rhod_params is None or fret_params is None:
+            return
+
         rhod_peaks, rhod_props = signal.find_peaks(
             rhod_data,
-            height=1.05,
-            distance=10,
-            prominence=0.05,
-            width=3
+            height=rhod_params['height'],
+            distance=rhod_params['distance'],
+            prominence=rhod_params['prominence'],
+            width=rhod_params['width']
         )
 
         fret_peaks, fret_props = signal.find_peaks(
             fret_data,
-            height=1.005,
-            distance=5,
-            prominence=0.003,
-            width=2
+            height=fret_params['height'],
+            distance=fret_params['distance'],
+            prominence=fret_params['prominence'],
+            width=fret_params['width']
         )
 
         rhod_peak_properties = []
@@ -1069,9 +2022,41 @@ class CaMKIIAnalyzer:
         self.rhod_peak_properties[reading_key] = rhod_peak_properties
         self.fret_peak_properties[reading_key] = fret_peak_properties
 
+        if getattr(self, 'boundary_diagnostics_enabled', False):
+            self._run_boundary_diagnostics(
+                reading_key,
+                {
+                    'Rhod': {
+                        'series': rhod_data,
+                        'peaks': self.rhod_peaks[reading_key],
+                        'props': rhod_peak_properties
+                    },
+                    'FRET': {
+                        'series': fret_data,
+                        'peaks': self.fret_peaks[reading_key],
+                        'props': fret_peak_properties
+                    }
+                }
+            )
+
+        rhod_hybrid = self._select_hybrid_boundaries(rhod_data, self.rhod_peaks[reading_key], rhod_peak_properties)
+        for props, (left_base, right_base) in zip(rhod_peak_properties, rhod_hybrid):
+            props['left_base'] = int(left_base)
+            props['right_base'] = int(right_base)
+
+        fret_hybrid = self._select_hybrid_boundaries(fret_data, self.fret_peaks[reading_key], fret_peak_properties)
+        for props, (left_base, right_base) in zip(fret_peak_properties, fret_hybrid):
+            props['left_base'] = int(left_base)
+            props['right_base'] = int(right_base)
+
         self.update_plot()
 
-        summary = f"Detected {len(rhod_peaks)} Rhod peaks and {len(fret_peaks)} FRET peaks."
+        summary = (
+            f"Detected {len(rhod_peaks)} Rhod peaks (h={rhod_params['height']}, prom={rhod_params['prominence']}, "
+            f"dist={rhod_params['distance']}, w={rhod_params['width']}) and "
+            f"{len(fret_peaks)} FRET peaks (h={fret_params['height']}, prom={fret_params['prominence']}, "
+            f"dist={fret_params['distance']}, w={fret_params['width']})."
+        )
         self.status_bar.config(text=summary)
         messagebox.showinfo("Peak Detection", summary)
         self._notify_peaks_updated()
@@ -1089,7 +2074,9 @@ class CaMKIIAnalyzer:
             del self.rhod_peak_properties[reading_key]
         if reading_key in self.fret_peak_properties:
             del self.fret_peak_properties[reading_key]
-            
+
+        self._reset_manual_matches(reading_key)
+
         self.update_plot()
         self.status_bar.config(text=f"All peaks cleared for Reading {reading}")
         self._notify_peaks_updated()
@@ -1099,6 +2086,13 @@ class CaMKIIAnalyzer:
         if event.inaxes is None or event.xdata is None:
             return
 
+        # Allow matplotlib zoom tool to handle the event without interference
+        if 'zoom' in self._toolbar_mode():
+            return
+
+        # Always disengage any lingering widget lock so clicks go to editing logic
+        self._clear_navigation_mode()
+
         reading = int(self.reading_var.get())
         reading_key = f'#{reading}'
 
@@ -1107,8 +2101,9 @@ class CaMKIIAnalyzer:
             return
 
         key = (event.key or '').lower()
-        if event.button == 1 and 'shift' in key:
-            self._add_peak_via_click(event, reading_key)
+        if event.button == 1:
+            if self.edit_mode or 'shift' in key:
+                self._add_peak_via_click(event, reading_key)
 
     def _remove_peak_via_click(self, event, reading_key):
         self._clear_navigation_mode()
@@ -1138,11 +2133,13 @@ class CaMKIIAnalyzer:
         nearest_idx = int(np.argmin(distances))
 
         if distances[nearest_idx] <= tolerance:
+            removed_idx = int(peaks[nearest_idx])
             peaks_dict[reading_key] = np.delete(peaks, nearest_idx)
             del props[nearest_idx]
             if len(peaks_dict[reading_key]) == 0:
                 peaks_dict.pop(reading_key, None)
                 props_dict.pop(reading_key, None)
+            self._clear_manual_match_override(label, reading_key, removed_idx)
             self.status_bar.config(
                 text=f"Removed {label} peak at {self.time_data[clicked_idx]:.2f} min"
             )
@@ -1246,10 +2243,6 @@ class CaMKIIAnalyzer:
         peaks_tab = ttk.Frame(notebook)
         notebook.add(peaks_tab, text="Peak Details")
         
-        # Correlation tab for Ca-CaMKII relationship
-        correlation_tab = ttk.Frame(notebook)
-        notebook.add(correlation_tab, text="Ca-CaMKII Correlation")
-        
         notebook.pack(fill=tk.BOTH, expand=True, padx=10, pady=10)
         
         # Summary results
@@ -1312,6 +2305,14 @@ class CaMKIIAnalyzer:
             summary_text.insert(tk.END, f"- Min delay: {np.min(delays):.2f} min\n")
             summary_text.insert(tk.END, f"- Max delay: {np.max(delays):.2f} min\n")
 
+        auto_match_map = {'Rhod': {}, 'FRET': {}}
+        for idx, pair in enumerate(matched_pairs, start=1):
+            auto_match_map['Rhod'][pair['rhod']['peak_idx']] = idx
+            auto_match_map['FRET'][pair['fret']['peak_idx']] = idx
+
+        rhod_match_map = self._resolve_match_map('Rhod', reading_key, rhod_metrics, auto_match_map['Rhod']) if rhod_metrics else {}
+        fret_match_map = self._resolve_match_map('FRET', reading_key, fret_metrics, auto_match_map['FRET']) if fret_metrics else {}
+
         # peak details tab
         peak_details = ttk.Frame(peaks_tab)
         peak_details.pack(fill=tk.BOTH, expand=True, padx=10, pady=10)
@@ -1319,15 +2320,60 @@ class CaMKIIAnalyzer:
         # create tables for peak details
         self.create_peak_details_table(peak_details, reading_key, rhod_metrics, fret_metrics)
 
-        # correlation tab
-        if matched_pairs:
-            self.create_correlation_analysis(correlation_tab, matched_pairs)
-        else:
-            ttk.Label(correlation_tab, text="Insufficient peaks for correlation analysis").pack(pady=20)
-        
-        # add save table button
-        ttk.Button(analysis_window, text="Save Analysis", 
-                  command=lambda: self.save_analysis(summary_text.get("1.0", tk.END))).pack(pady=10)
+        button_frame = tk.Frame(analysis_window, bd=0)
+        button_frame.pack(side=tk.BOTTOM, fill=tk.X, padx=10, pady=(0, 10))
+
+        button_opts = {
+            'height': 1,
+            'padx': 10,
+            'pady': 4,
+            'bd': 1,
+            'relief': tk.RAISED,
+            'highlightthickness': 0
+        }
+
+        combined_btn = tk.Button(
+            button_frame,
+            text="Export Rhod & FRET Peaks",
+            command=lambda: self._export_all_peak_metrics(
+                reading,
+                {
+                    'Rhod': (rhod_metrics, rhod_match_map),
+                    'FRET': (fret_metrics, fret_match_map)
+                }
+            ),
+            **button_opts
+        )
+        combined_btn.pack(side=tk.LEFT, padx=(0, 6))
+        if not (rhod_metrics or fret_metrics):
+            combined_btn.config(state=tk.DISABLED)
+
+        export_rhod_btn = tk.Button(
+            button_frame,
+            text="Export Rhod Peaks",
+            command=lambda: self._export_peak_metrics('Rhod', reading, rhod_metrics, rhod_match_map),
+            **button_opts
+        )
+        export_rhod_btn.pack(side=tk.LEFT, padx=(0, 6))
+        if not rhod_metrics:
+            export_rhod_btn.config(state=tk.DISABLED)
+
+        export_fret_btn = tk.Button(
+            button_frame,
+            text="Export FRET Peaks",
+            command=lambda: self._export_peak_metrics('FRET', reading, fret_metrics, fret_match_map),
+            **button_opts
+        )
+        export_fret_btn.pack(side=tk.LEFT, padx=(0, 6))
+        if not fret_metrics:
+            export_fret_btn.config(state=tk.DISABLED)
+
+        tk.Button(
+            button_frame,
+            text="Save Analysis",
+            command=lambda: self.save_analysis(summary_text.get("1.0", tk.END)),
+            **button_opts
+        ).pack(side=tk.RIGHT)
     
     def create_peak_details_table(self, parent, reading_key, rhod_metrics, fret_metrics):
         # create separate frames for Rhod and FRET
@@ -1393,73 +2439,6 @@ class CaMKIIAnalyzer:
         else:
             ttk.Label(fret_frame, text="No FRET peaks detected").pack(pady=20)
     
-    #TODO: decide if we even need this - flawed assumption
-    def create_correlation_analysis(self, parent, matched_pairs):
-        # create a matplotlib figure for correlation plotting
-        fig = Figure(figsize=(8, 6))
-        ax = fig.add_subplot(111)
-        
-        if matched_pairs:
-            df = pd.DataFrame({
-                'Ca_amplitude': [pair['rhod']['amplitude'] for pair in matched_pairs],
-                'CaMKII_amplitude': [pair['fret']['amplitude'] for pair in matched_pairs],
-                'Ca_AUC': [pair['rhod']['auc'] for pair in matched_pairs],
-                'CaMKII_AUC': [pair['fret']['auc'] for pair in matched_pairs],
-                'Delay': [pair['delay'] for pair in matched_pairs]
-            })
-
-            ax.scatter(df['Ca_amplitude'], df['CaMKII_amplitude'],
-                      c=df['Delay'], cmap='viridis', s=100, alpha=0.7)
-            ax.set_xlabel('Ca²⁺ Peak Amplitude')
-            ax.set_ylabel('CaMKII Peak Amplitude')
-            ax.set_title('Ca²⁺ vs CaMKII Peak Amplitude Correlation')
-            
-            # Add best fit line
-            if len(df) > 1:  # Need at least 2 points for regression
-                slope, intercept, r_value, p_value, std_err = stats.linregress(
-                    df['Ca_amplitude'], df['CaMKII_amplitude'])
-                x = np.array([df['Ca_amplitude'].min(), df['Ca_amplitude'].max()])
-                y = slope * x + intercept
-                ax.plot(x, y, 'r--', 
-                       label=f'y = {slope:.2f}x + {intercept:.2f}\nr² = {r_value**2:.2f}')
-                ax.legend()
-            
-            # Add colorbar for delay
-            cbar = fig.colorbar(ax.collections[0])
-            cbar.set_label('Delay (min)')
-            
-            # Add the plot to the tab
-            canvas = FigureCanvasTkAgg(fig, master=parent)
-            canvas.draw()
-            canvas.get_tk_widget().pack(fill=tk.BOTH, expand=True, padx=10, pady=10)
-            
-            # Add correlation statistics
-            stats_frame = ttk.LabelFrame(parent, text="Correlation Statistics")
-            stats_frame.pack(fill=tk.X, padx=10, pady=5)
-            
-            stats_text = tk.Text(stats_frame, height=8, width=80)
-            stats_text.pack(padx=5, pady=5, fill=tk.BOTH)
-            
-            # Calculate correlations
-            amp_corr = df['Ca_amplitude'].corr(df['CaMKII_amplitude'])
-            auc_corr = df['Ca_AUC'].corr(df['CaMKII_AUC'])
-            
-            stats_text.insert(tk.END, f"Number of matched peaks: {len(df)}\n")
-            stats_text.insert(tk.END, f"Amplitude correlation (r): {amp_corr:.3f}\n")
-            stats_text.insert(tk.END, f"AUC correlation (r): {auc_corr:.3f}\n")
-            stats_text.insert(tk.END, f"Average delay: {df['Delay'].mean():.2f} min\n")
-            stats_text.insert(tk.END, f"Std. deviation of delay: {df['Delay'].std():.2f} min\n")
-            
-            if len(df) > 1 and not np.isnan(amp_corr):
-                # Linear regression stats for amplitude correlation
-                stats_text.insert(tk.END, f"\nLinear regression:\n")
-                stats_text.insert(tk.END, f"Slope: {slope:.3f}\n")
-                stats_text.insert(tk.END, f"Intercept: {intercept:.3f}\n")
-                stats_text.insert(tk.END, f"R-squared: {r_value**2:.3f}\n")
-                stats_text.insert(tk.END, f"p-value: {p_value:.4f}\n")
-        else:
-            ttk.Label(parent, text="Could not match Ca and CaMKII peaks for correlation analysis").pack(pady=20)
-    
     def save_analysis(self, analysis_text):
         file_path = filedialog.asksaveasfilename(
             defaultextension=".txt",
@@ -1469,7 +2448,97 @@ class CaMKIIAnalyzer:
             with open(file_path, 'w') as f:
                 f.write(analysis_text)
             messagebox.showinfo("Success", f"Analysis saved to {file_path}")
-    
+
+    def _build_peak_export_rows(self, dataset, metrics, match_map):
+        rows = []
+        for metric in metrics:
+            peak_idx = metric['peak_idx']
+            time_value = float(self.time_data.iloc[peak_idx]) if self.time_data is not None else float('nan')
+            rows.append({
+                'Dataset': dataset,
+                'Match ID': match_map.get(peak_idx, ''),
+                'Peak Number': metric['ordinal'],
+                'Peak Time (min)': round(time_value, 4),
+                'Peak Signal': round(float(metric['peak_value']), 6),
+                'Baseline Level': round(float(metric['baseline']), 6),
+                'Amplitude (peak-baseline)': round(float(metric['amplitude']), 6),
+                'Width (min)': round(float(metric['width']), 6),
+                'AUC': round(float(metric['auc']), 6),
+                'Rise Time (min)': round(float(metric['rise_time']), 6),
+                'Decay Time (min)': round(float(metric['decay_time']), 6),
+                'Left Index': metric['left_idx'],
+                'Right Index': metric['right_idx']
+            })
+        return rows
+
+    def _export_peak_metrics(self, dataset, reading_number, metrics, match_map):
+        if not metrics:
+            messagebox.showinfo("Export Peaks", f"No {dataset} peaks available to export.")
+            return
+
+        rows = self._build_peak_export_rows(dataset, metrics, match_map)
+        df = pd.DataFrame(rows)
+
+        default_name = f"{dataset.lower()}_peaks_reading_{reading_number}.csv"
+        file_path = filedialog.asksaveasfilename(
+            defaultextension='.csv',
+            filetypes=[("CSV files", "*.csv"), ("All files", "*.*")],
+            initialfile=default_name
+        )
+
+        if not file_path:
+            return
+
+        try:
+            df.to_csv(file_path, index=False)
+        except Exception as exc:
+            messagebox.showerror(
+                "Export Peaks",
+                f"Failed to export {dataset} peaks:\n{exc}"
+            )
+            return
+
+        messagebox.showinfo(
+            "Export Peaks",
+            f"Saved {dataset} peak table to {file_path}"
+        )
+
+    def _export_all_peak_metrics(self, reading_number, dataset_payload):
+        rows = []
+        for dataset, (metrics, match_map) in dataset_payload.items():
+            if metrics:
+                rows.extend(self._build_peak_export_rows(dataset, metrics, match_map))
+
+        if not rows:
+            messagebox.showinfo("Export Peaks", "No peaks available to export.")
+            return
+
+        df = pd.DataFrame(rows)
+
+        default_name = f"rhod_fret_peaks_reading_{reading_number}.csv"
+        file_path = filedialog.asksaveasfilename(
+            defaultextension='.csv',
+            filetypes=[("CSV files", "*.csv"), ("All files", "*.*")],
+            initialfile=default_name
+        )
+
+        if not file_path:
+            return
+
+        try:
+            df.to_csv(file_path, index=False)
+        except Exception as exc:
+            messagebox.showerror(
+                "Export Peaks",
+                f"Failed to export peaks:\n{exc}"
+            )
+            return
+
+        messagebox.showinfo(
+            "Export Peaks",
+            f"Saved Rhod and FRET peak tables to {file_path}"
+        )
+
     #TODO: make this whole thing work to adjust peak boundaries manually
     def adjust_peak_boundaries(self):
         reading = int(self.reading_var.get())
@@ -1611,7 +2680,8 @@ class CaMKIIAnalyzer:
             update_rhod_sliders()  # Initialize with first peak
         else:
             ttk.Label(rhod_tab, text="No Rhod peaks detected").pack(pady=20)
-        
+
+
         # Close button
         ttk.Button(
             adjustment_window,
@@ -1642,6 +2712,109 @@ class CaMKIIAnalyzer:
                 self.rhod_peak_properties[reading_key][peak_idx]['right_base'] = right_idx
                 self.update_plot()
                 messagebox.showinfo("Success", f"Updated boundaries for Rhod peak #{peak_idx+1}")
+
+def generate_boundary_diagnostics_cli(
+    rhod_path='rhod.xlsx',
+    fret_path='fret.xlsx',
+    reading=1,
+    output_dir='boundary_diagnostics',
+    rhod_params=None,
+    fret_params=None
+):
+    """Run boundary diagnostics without launching the Tk UI."""
+
+    analyzer = CaMKIIAnalyzer.__new__(CaMKIIAnalyzer)
+
+    analyzer.rhod_data = pd.read_excel(rhod_path, sheet_name='Raw Data')
+    analyzer.fret_data = pd.read_excel(fret_path, sheet_name='Raw Data')
+
+    time_series = analyzer.rhod_data['Time [ms]'].astype(float) / 60000.0
+    analyzer.time_data = time_series.reset_index(drop=True)
+
+    analyzer.rhod_normalized = {}
+    analyzer.fret_normalized = {}
+    analyzer.manual_match_overrides = {'Rhod': {}, 'FRET': {}}
+    analyzer.rhod_peaks = {}
+    analyzer.fret_peaks = {}
+    analyzer.rhod_peak_properties = {}
+    analyzer.fret_peak_properties = {}
+    analyzer._table_item_lookup = {'Rhod': {}, 'FRET': {}}
+    analyzer._hovered_peak = {'Rhod': None, 'FRET': None}
+    analyzer._table_edit_entry = None
+    analyzer._table_edit_meta = None
+    analyzer._boundary_diag_dir = os.path.abspath(output_dir)
+    analyzer.boundary_diagnostics_enabled = True
+
+    analyzer.normalize_rhod_data()
+    analyzer.normalize_fret_data()
+
+    if rhod_params is None:
+        rhod_params = {'height': 1.05, 'prominence': 0.05, 'distance': 10, 'width': 3}
+    if fret_params is None:
+        fret_params = {'height': 1.005, 'prominence': 0.003, 'distance': 5, 'width': 2}
+
+    reading_key = f'#{reading}'
+    rhod_series = analyzer.rhod_normalized.get(reading_key)
+    fret_series = analyzer.fret_normalized.get(reading_key)
+
+    if rhod_series is None or fret_series is None:
+        raise ValueError(f'Reading {reading} not found in normalized data sets.')
+
+    rhod_peaks, rhod_props = signal.find_peaks(
+        rhod_series,
+        height=rhod_params['height'],
+        distance=rhod_params['distance'],
+        prominence=rhod_params['prominence'],
+        width=rhod_params['width']
+    )
+
+    fret_peaks, fret_props = signal.find_peaks(
+        fret_series,
+        height=fret_params['height'],
+        distance=fret_params['distance'],
+        prominence=fret_params['prominence'],
+        width=fret_params['width']
+    )
+
+    rhod_peak_properties = []
+    for i in range(len(rhod_peaks)):
+        rhod_peak_properties.append({
+            'peak_idx': int(rhod_peaks[i]),
+            'left_base': int(rhod_props['left_bases'][i]),
+            'right_base': int(rhod_props['right_bases'][i]),
+            'peak_height': float(rhod_props['peak_heights'][i]),
+            'prominence': float(rhod_props['prominences'][i]),
+            'width': float(rhod_props['widths'][i])
+        })
+
+    fret_peak_properties = []
+    for i in range(len(fret_peaks)):
+        fret_peak_properties.append({
+            'peak_idx': int(fret_peaks[i]),
+            'left_base': int(fret_props['left_bases'][i]),
+            'right_base': int(fret_props['right_bases'][i]),
+            'peak_height': float(fret_props['peak_heights'][i]),
+            'prominence': float(fret_props['prominences'][i]),
+            'width': float(fret_props['widths'][i])
+        })
+
+    analyzer._run_boundary_diagnostics(
+        reading_key,
+        {
+            'Rhod': {
+                'series': rhod_series,
+                'peaks': np.array(rhod_peaks, dtype=int),
+                'props': rhod_peak_properties
+            },
+            'FRET': {
+                'series': fret_series,
+                'peaks': np.array(fret_peaks, dtype=int),
+                'props': fret_peak_properties
+            }
+        }
+    )
+
+    return os.path.abspath(analyzer._boundary_diag_dir)
 
 # Create and run the application
 if __name__ == "__main__":
